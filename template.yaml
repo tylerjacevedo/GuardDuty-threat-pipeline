@@ -1,0 +1,252 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CS 79C final project - Automated GuardDuty threat detection and response pipeline.
+  GuardDuty finding -> EventBridge rule (severity 4+) -> Lambda -> S3 audit log + SNS email alert.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email that receives finding alerts (confirm the subscription email after deploying)
+    AllowedPattern: ^[^@\s]+@[^@\s]+\.[^@\s]+$
+    ConstraintDescription: Must be a valid email address
+  OwnerName:
+    Type: String
+    Description: Your full name - stamped on every processed finding (emails, S3 records, Lambda logs)
+    MinLength: 1
+  CreateDetector:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      true = this stack turns GuardDuty on (and deleting the stack turns it off).
+      Use false only if GuardDuty is already enabled in this region.
+
+Conditions:
+  ShouldCreateDetector: !Equals [!Ref CreateDetector, "true"]
+
+Resources:
+  # ---------- Detection: GuardDuty (one detector allowed per region) ----------
+  Detector:
+    Type: AWS::GuardDuty::Detector
+    Condition: ShouldCreateDetector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+
+  # ---------- Storage: audit trail of every processed finding ----------
+  FindingsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldFindings
+            Status: Enabled
+            ExpirationInDays: 90
+
+  FindingsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FindingsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt FindingsBucket.Arn
+              - !Sub "${FindingsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------- Notification: email alerts ----------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: GuardDuty Alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ---------- Logging: created by the stack so it is deleted with the stack ----------
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-processor
+      RetentionInDays: 14
+
+  # ---------- Permissions: each action scoped to one resource ----------
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: least-privilege-processor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${ProcessorLogGroup.Arn}"
+              - Sid: WriteFindingRecords
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${FindingsBucket.Arn}/findings/*"
+              - Sid: PublishAlerts
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  # ---------- Processing: classify, stamp name, store, alert ----------
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ProcessorLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-processor
+      Description: Classifies GuardDuty findings, writes them to S3 and emails an alert
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ProcessorRole.Arn
+      Timeout: 15
+      MemorySize: 128
+      Environment:
+        Variables:
+          BUCKET: !Ref FindingsBucket
+          TOPIC_ARN: !Ref AlertTopic
+          OWNER_NAME: !Ref OwnerName
+      Code:
+        ZipFile: |
+          import json, os, datetime
+          import boto3
+
+          s3 = boto3.client("s3")
+          sns = boto3.client("sns")
+
+          ACTIONS = {
+              "Backdoor": "Isolate the instance and check for persistence.",
+              "CryptoCurrency": "Stop the instance and look for mining software.",
+              "Trojan": "Isolate the instance and scan for malware.",
+              "UnauthorizedAccess": "Rotate exposed credentials and review access logs.",
+              "Recon": "Tighten security groups and block the source IP.",
+              "Exfiltration": "Block outbound traffic and review data access.",
+              "Impact": "Contain the resource and assess damage.",
+              "Policy": "Review the configuration against security policy.",
+          }
+
+          def label(sev):
+              if sev >= 9: return "CRITICAL"
+              if sev >= 7: return "HIGH"
+              if sev >= 4: return "MEDIUM"
+              return "LOW"
+
+          def handler(event, context):
+              owner = os.environ["OWNER_NAME"]
+              d = event["detail"]
+              sev = float(d.get("severity", 0))
+              ftype = d.get("type", "Unknown")
+              category = ftype.split(":")[0]
+              now = datetime.datetime.now(datetime.timezone.utc)
+              record = {
+                  "processed_by": owner,
+                  "processed_at": now.isoformat(),
+                  "severity_label": label(sev),
+                  "recommended_action": ACTIONS.get(category, "Investigate in the GuardDuty console."),
+                  "is_sample": d.get("service", {}).get("additionalInfo", {}).get("sample", False),
+                  "finding_id": d.get("id"),
+                  "type": ftype,
+                  "severity": sev,
+                  "title": d.get("title"),
+                  "account": d.get("accountId"),
+                  "region": d.get("region"),
+                  "resource_type": d.get("resource", {}).get("resourceType"),
+                  "raw_finding": d,
+              }
+              key = "findings/%s/%s.json" % (now.strftime("%Y/%m/%d"), d.get("id", context.aws_request_id))
+              s3.put_object(Bucket=os.environ["BUCKET"], Key=key,
+                            Body=json.dumps(record, indent=2, default=str),
+                            ContentType="application/json")
+
+              subject = ("[%s] GuardDuty: %s" % (record["severity_label"], ftype))[:99]
+              body = "\n".join([
+                  "GuardDuty threat alert - processed by %s" % owner,
+                  "",
+                  "Severity: %s (%s)" % (record["severity_label"], sev),
+                  "Type: %s" % ftype,
+                  "Title: %s" % record["title"],
+                  "Resource: %s" % record["resource_type"],
+                  "Account / Region: %s / %s" % (record["account"], record["region"]),
+                  "Sample finding: %s" % record["is_sample"],
+                  "",
+                  "Recommended action: %s" % record["recommended_action"],
+                  "",
+                  "Full record: s3://%s/%s" % (os.environ["BUCKET"], key),
+              ])
+              sns.publish(TopicArn=os.environ["TOPIC_ARN"], Subject=subject, Message=body)
+
+              print(json.dumps({"processed_by": owner, "type": ftype,
+                                "severity": sev, "s3_key": key}))
+              return {"status": "ok", "s3_key": key}
+
+  # ---------- Routing: only medium severity and above ----------
+  FindingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Send GuardDuty findings with severity 4+ to the processor Lambda
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+        detail:
+          severity:
+            - numeric: [">=", 4]
+      Targets:
+        - Id: ProcessorTarget
+          Arn: !GetAtt ProcessorFunction.Arn
+
+  AllowEventBridgeInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FindingRule.Arn
+
+Outputs:
+  FindingsBucketName:
+    Description: S3 bucket holding the processed finding records
+    Value: !Ref FindingsBucket
+  AlertTopicArn:
+    Description: SNS topic for email alerts
+    Value: !Ref AlertTopic
+  ProcessorFunctionName:
+    Description: Lambda function that processes findings
+    Value: !Ref ProcessorFunction
+  RuleName:
+    Description: EventBridge rule filtering severity 4+
+    Value: !Ref FindingRule
+  DetectorId:
+    Condition: ShouldCreateDetector
+    Description: GuardDuty detector created by this stack
+    Value: !Ref Detector
